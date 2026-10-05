@@ -542,6 +542,92 @@ function renderSignoffHistoryHtml(cue, v) {
     <div class="muted">签认记录随版本保存；目标或任一直接前置项登记行变化、代班变更导致签认人失去登记权，均会使签认失效，需重新签认。</div>`;
 }
 
+// 联排中断对未开始项重算开始的「不得早于恢复/停排时刻」托底标注
+function pauseHoldTag(c) {
+  return c.pauseHoldText ? `<div class="pause-hold" title="联排中断后重算开始不得早于该时刻">⏸ 不早于 ${esc(c.pauseHoldText)}</div>` : '';
+}
+
+// 联排中断对已开始未完成项推算 / 预计结束的顺延标注
+function pauseShiftTag(c) {
+  return c.pauseShiftMinutes > 0
+    ? `<div class="pause-shift" title="按时长推算结束 / 停排前预计结束顺延该段中断分钟，且不早于最近恢复时刻；实际登记时间不变">⏸ 中断顺延 ${c.pauseShiftMinutes} 分</div>`
+    : '';
+}
+
+function fmtInterruption(it) {
+  if (it.active) {
+    return `<strong class="mono">${esc(it.pauseText)}</strong> 起停排中｜原因：${esc(it.reason)}｜${esc(it.pausedBy)} 于 ${esc(it.pausedAt)} 登记`;
+  }
+  return `<span class="mono">${esc(it.pauseText)} – ${esc(it.resumeText)}</span>（${it.durationMinutes} 分）｜原因：${esc(it.reason)}
+    ｜停排 ${esc(it.pausedBy)} ${esc(it.pausedAt)}｜恢复 ${esc(it.resumedBy)} ${esc(it.resumedAt)}`;
+}
+
+// 停排状态横幅：所有登录用户可见（执行账号与舞监）
+function renderInterruptionBanner(v) {
+  const box = $('#live-interruption-banner');
+  if (!v) { box.innerHTML = ''; return; }
+  const a = v.activeInterruption;
+  if (a) {
+    box.innerHTML = `<div class="pause-banner">
+      <div class="pause-banner-title">⛔ 联排停排中（第 ${v.versionNo} 版）　自 <strong class="mono">${esc(a.pauseText)}</strong> 起</div>
+      <div>停排原因：${esc(a.reason)}</div>
+      <div class="muted">${esc(a.pausedBy)} 于 ${esc(a.pausedAt)} 登记｜恢复前不能登记开始 / 预计结束 / 完成、不能新签认，也不能发布新版；舞监更正、跳过仍可办理。</div>
+    </div>`;
+    return;
+  }
+  const past = (v.interruptions || []).filter((it) => !it.active);
+  if (past.length) {
+    box.innerHTML = `<div class="pause-resumed-banner">
+      ✅ 联排已恢复：本版已记录 ${past.length} 段停排（最近 <strong class="mono">${esc(past[0].pauseText)}–${esc(past[0].resumeText)}</strong>，${past[0].durationMinutes} 分），未开始项排期不早于最近恢复时刻，停排前双签须重签。
+    </div>`;
+    return;
+  }
+  box.innerHTML = '';
+}
+
+// 舞监停排 / 恢复操作面板（仅当前执行版）
+function renderInterruptionPanel(v) {
+  const panel = $('#interruption-panel');
+  const show = state.me?.role === 'sm' && v && v.isLatest;
+  panel.hidden = !show;
+  if (!show) return;
+  const body = $('#interruption-body');
+  const a = v.activeInterruption;
+  const history = (v.interruptions || []).filter((it) => !it.active).slice(0, 5);
+  const histHtml = history.length
+    ? `<div class="pause-history"><div class="muted">本版停排记录（留痕回看）：</div>
+        <ul>${history.map((it) => `<li>${fmtInterruption(it)}</li>`).join('')}</ul></div>`
+    : '<div class="muted">本版暂无停排记录。</div>';
+  if (a) {
+    body.innerHTML = `
+      <div class="pause-active-box">
+        <div class="pause-banner-title">⛔ 停排中：${fmtInterruption(a)}</div>
+        <form id="pause-resume-form" class="pause-form">
+          <label>恢复时刻（HH:MM，严格晚于停排时刻 ${esc(a.pauseText)}）
+            <input type="time" name="resumeText" required />
+          </label>
+          <button type="submit" class="primary">恢复联排</button>
+        </form>
+        <div class="muted">恢复后：未开始项重算开始不早于恢复时刻；已开始未完成项推算 / 预计结束顺延本次中断分钟且不早于恢复时刻；依赖顺延与同岗位冲突同步更新；停排前双签已失效须重签。实际登记时间不变。</div>
+      </div>
+      ${histHtml}`;
+  } else {
+    const last = history[0];
+    body.innerHTML = `
+      <form id="pause-start-form" class="pause-form">
+        <label>停排时刻（HH:MM${last ? `，须晚于最近恢复时刻 ${last.resumeText}` : ''}）
+          <input type="time" name="pauseText" required />
+        </label>
+        <label class="pause-reason-label">停排原因（必填，≤200 字）
+          <textarea name="reason" rows="2" maxlength="200" required placeholder="如：设备故障、演员临时受伤处理"></textarea>
+        </label>
+        <button type="submit" class="danger">停排</button>
+      </form>
+      <div class="muted">停排即：清除全部未开始项的原预计结束（推进登记行版本并留痕）、停排前有效双签整体失效（保留原因）；执行岗位登记 / 新签认与发布新版在恢复前一律拒绝。</div>
+      ${histHtml}`;
+  }
+}
+
 function renderConflicts(conflicts) {
   const box = $('#live-conflicts');
   if (!conflicts?.length) { box.innerHTML = ''; return; }
@@ -555,8 +641,10 @@ function renderLive() {
   if (!v) {
     $('#live-meta').innerHTML = '<div class="muted">尚未发布任何联排版本，请等待舞监发布。</div>';
     $('#live-conflicts').innerHTML = '';
+    $('#live-interruption-banner').innerHTML = '';
     $('#live-deputy-banner').innerHTML = '';
     $('#deputy-panel').hidden = true;
+    $('#interruption-panel').hidden = true;
     $('#whatif-panel').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
@@ -565,6 +653,8 @@ function renderLive() {
     `<strong>第 ${v.versionNo} 版</strong>　${esc(v.note)}　<span class="muted">发布于 ${esc(v.createdAt)}</span>
      ${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : '<span class="latest-tag" style="background:#999">非最新版本</span>'}`;
   renderConflicts(v.conflicts);
+  renderInterruptionBanner(v);
+  renderInterruptionPanel(v);
   renderDeputyBanner(v);
   renderDeputyPanel(v);
 
@@ -574,6 +664,7 @@ function renderLive() {
   // 现场页面按最新授权显示可操作项：优先用服务器下发的有效岗位（含代班），兼容旧响应
   const myPositions = Array.isArray(v.myPositions) ? v.myPositions : (isOp && myPos ? [myPos] : []);
   const canReg = isOp && v.isLatest;
+  const pauseActive = !!v.activeInterruption;
   $('#live-col-reg').textContent = isSM ? '签认 / 跳过 / 更正 / 预演' : '岗位登记';
   $('#sm-correct-hint').hidden = !isSM;
   const skipHint = $('#sm-skip-hint');
@@ -594,6 +685,9 @@ function renderLive() {
       reg = isSM
         ? `<div class="corr-actions"><button class="ghost tiny" data-act="open-skip-view" data-cue="${c.id}">跳过原因</button>${histBtn}</div>`
         : '<span class="muted">已跳过</span>';
+    } else if (pauseActive && isOp && mine) {
+      // 停排期间执行岗位的开始 / 预计结束 / 完成一律不可登记（恢复后再操作）
+      reg = '<span class="pause-locked">⛔ 停排中，暂停登记</span>';
     } else if (canReg && mine) {
       reg = renderRegControls(c);
     } else if (mine && isOp) {
@@ -604,13 +698,13 @@ function renderLive() {
     } else if (isSM) {
       reg = renderCorrectionCell(c, v, 'live');
     }
-    return `<tr class="${mine ? 'own-row' : ''} ${skipped ? 'skipped-row' : ''}" data-cue="${c.id}">
+    return `<tr class="${mine ? 'own-row' : ''} ${skipped ? 'skipped-row' : ''} ${c.interrupted ? 'interrupted-row' : ''}" data-cue="${c.id}">
       <td><strong>${esc(c.code)}</strong>${c.release?.required ? '<div class="release-tag">需放行</div>' : ''}</td>
       <td>${esc(c.title)}</td>
       <td>${esc(c.position)}${deputyPosTag(activeDepByPos.get(c.position))}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-      <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}`}<div>${explainBtn(c, 'live')}</div></td>
-      <td class="mono">${skipped ? '—' : c.schedEndText}</td>
+      <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}${pauseHoldTag(c)}`}<div>${explainBtn(c, 'live')}</div></td>
+      <td class="mono">${skipped ? '—' : `${c.schedEndText}${pauseShiftTag(c)}`}</td>
       <td>${statusBadge(c.status)}<div class="muted">v${c.rowVer}</div></td>
       <td>${releaseCell(c)}</td>
       <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>
@@ -672,6 +766,46 @@ function renderDeputyPanel(v) {
   </tr>`).join('') || '<tr><td colspan="6" class="muted">当前执行版暂无代班记录。</td></tr>';
 }
 
+// ---------- 舞监：联排中断（停排 / 恢复） ----------
+
+$('#interruption-panel').addEventListener('submit', async (ev) => {
+  const form = ev.target.closest('#pause-start-form, #pause-resume-form');
+  if (!form) return;
+  ev.preventDefault();
+  const v = state.live;
+  if (!v) return;
+  const btn = form.querySelector('button[type="submit"]');
+  btn.disabled = true;
+  try {
+    if (form.id === 'pause-start-form') {
+      const pauseText = form.elements.pauseText.value;
+      const reason = form.elements.reason.value.trim();
+      if (!pauseText) { alertBar('error', '请填写停排时刻'); btn.disabled = false; return; }
+      if (!reason) { alertBar('error', '请填写停排原因'); btn.disabled = false; return; }
+      if (!confirm(`确认在 ${pauseText} 停排？\n将清除全部未开始项的原预计结束、停排前有效双签失效；执行岗位登记 / 新签认与发布新版在恢复前一律拒绝。`)) { btn.disabled = false; return; }
+      const data = await api('POST', '/api/live/interruptions', { versionId: v.id, pauseText, reason });
+      state.live = data.version;
+      renderLive();
+      alertBar('error', `⛔ 已在 ${pauseText} 停排（${data.clearedEstimatedEnds} 项未开始预计结束已清除）；恢复后双签须重签。`, 9000);
+    } else {
+      const resumeText = form.elements.resumeText.value;
+      if (!resumeText) { alertBar('error', '请填写恢复时刻'); btn.disabled = false; return; }
+      if (!confirm(`确认在 ${resumeText} 恢复联排？\n未开始项排期不早于该时刻，已开始未完成项结束顺延该中断分钟。`)) { btn.disabled = false; return; }
+      const data = await api('POST', '/api/live/interruptions/resume', { versionId: v.id, resumeText });
+      state.live = data.version;
+      renderLive();
+      const n = data.version.conflicts.length;
+      alertBar(n ? 'error' : 'ok',
+        `✅ 已在 ${resumeText} 恢复联排，排期与同岗位冲突已按中断顺延重算。` + (n ? ` 当前 ${n} 项冲突请查看红条。` : ''),
+        n ? 9000 : 6000);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    alertBar('error', errorToHtml(e), 10000);
+    if (e.status === 409) loadLive().catch(() => {});
+  }
+});
+
 $('#deputy-enable').addEventListener('click', async () => {
   const position = $('#deputy-position').value;
   const username = $('#deputy-operator').value;
@@ -712,13 +846,15 @@ function renderRegControls(c) {
   // 需放行项：双签齐备前「开始」禁用并提示；执行人可签认「就绪」（签认不推进行版本）
   const needRelease = c.release?.required === true;
   const releaseReady = c.release?.ready === true;
+  const pauseActive = !!state.live.activeInterruption;
   let buttons = '';
   if (c.status === 'PENDING') {
     const startBtn = needRelease && !releaseReady
       ? `<button class="primary tiny" data-reg="start" ${common} disabled title="需放行项：须执行人「签认就绪」与舞监「签认可执行」均有效后才能登记实际开始">开始（待双签）</button>`
       : `<button class="primary tiny" data-reg="start" ${common}>开始</button>`;
-    const signoffBtn = needRelease && c.release.operator.state !== 'valid'
-      ? `<div class="reg-actions"><button class="warn tiny" data-signoff="operator" ${common}>签认就绪</button></div>` : '';
+    const signoffBtn = needRelease && c.release.operator.state !== 'valid' && !pauseActive
+      ? `<div class="reg-actions"><button class="warn tiny" data-signoff="operator" ${common}>签认就绪</button></div>`
+      : (needRelease && pauseActive ? '<div class="muted">停排中，恢复后重签</div>' : '');
     buttons = `
       <div class="reg-actions">
         <input type="time" data-role="start-time" title="留空取当前时间" />
@@ -826,8 +962,8 @@ function renderCorrectionCell(c, v, scope) {
     || (v.isLatest && scope === 'live' && c.status === 'RUNNING')
     ? `<button class="ghost tiny" data-act="open-whatif" data-cue="${c.id}">顺延预演</button>`
     : '';
-  // 需放行项：舞监签认「可执行」（仅当前执行版、未开始项；签认不推进行版本）
-  const signoffBtn = (v.isLatest && scope === 'live' && c.release?.required && c.status === 'PENDING' && c.release.sm.state !== 'valid')
+  // 需放行项：舞监签认「可执行」（仅当前执行版、未开始项；停排期间禁止新签认；签认不推进行版本）
+  const signoffBtn = (v.isLatest && scope === 'live' && c.release?.required && c.status === 'PENDING' && c.release.sm.state !== 'valid' && !v.activeInterruption)
     ? `<button class="warn tiny" data-signoff="sm" data-cue="${c.id}" data-ver="${c.rowVer}" data-version-id="${v.id}">签认可执行</button>`
     : '';
   const corrBtn = v.isLatest && scope === 'live'
@@ -1435,9 +1571,10 @@ function renderVersions() {
       <td>${v.cueCount}</td>
       <td>${v.regCount}</td>
       <td>${v.skipCount ? `<span class="skip-count">⛔ ${v.skipCount}</span>` : 0}</td>
+      <td>${v.interruptionCount ? `<span class="pause-count ${v.interruptionActive ? 'pause-count-active' : ''}">⏸ ${v.interruptionCount}${v.interruptionActive ? '（进行中）' : ''}</span>` : 0}</td>
       <td><button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button></td>
     </tr>`).join('')
-    || '<tr><td colspan="7" class="muted">暂无已发布版本。</td></tr>';
+    || '<tr><td colspan="8" class="muted">暂无已发布版本。</td></tr>';
 }
 
 $('#versions-tbody').addEventListener('click', async (ev) => {
@@ -1500,12 +1637,28 @@ function renderDetail() {
             <td class="mono">${d.active ? '—' : `${esc(d.revokedBy || '')}<br>${esc(d.revokedAt || '')}`}</td>
           </tr>`).join('')}</tbody>
         </table></div></div>` : '';
+  // 旧版联排中断记录只读可查（含进行中/已恢复、停排与恢复的操作者、时间、原因、分钟数）
+  const interruptionHtml = (v.interruptions || []).length
+    ? `<div class="panel"><h3>联排中断记录（只读 · ${v.interruptions.length} 段${v.activeInterruption ? '，当前停排中' : '，均已恢复'}）</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>停排</th><th>恢复</th><th>中断(分)</th><th>原因</th><th>停排（操作者 / 时间）</th><th>恢复（操作者 / 时间）</th></tr></thead>
+          <tbody>${v.interruptions.map((it) => `<tr class="${it.active ? 'pause-row-active' : ''}">
+            <td class="mono">${esc(it.pauseText)}</td>
+            <td class="mono">${it.active ? '<span class="pause-locked">⛔ 停排中</span>' : esc(it.resumeText)}</td>
+            <td class="mono">${it.durationMinutes ?? '—'}</td>
+            <td>${esc(it.reason)}</td>
+            <td class="mono">${esc(it.pausedBy)}<br>${esc(it.pausedAt)}</td>
+            <td class="mono">${it.active ? '—' : `${esc(it.resumedBy)}<br>${esc(it.resumedAt)}`}</td>
+          </tr>`).join('')}</tbody>
+        </table></div></div>` : '';
   $('#version-detail').innerHTML = `
     <div class="panel">
       <h3>回看：第 ${v.versionNo} 版（只读）${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : ''}</h3>
       <div class="muted">${esc(v.note)} · 发布于 ${esc(v.createdAt)}</div>
     </div>
+    ${v.activeInterruption ? `<div class="pause-banner">⛔ 该版本当前停排中（自 <strong class="mono">${esc(v.activeInterruption.pauseText)}</strong> 起，原因：${esc(v.activeInterruption.reason)}），登记 / 新签认 / 发布均被拒绝。</div>` : ''}
     ${conflictHtml}
+    ${interruptionHtml}
     ${deputyHtml}
     <div class="panel"><div class="table-wrap"><table>
       <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>放行签认</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>
@@ -1518,8 +1671,8 @@ function renderDetail() {
         <td>${esc(c.title)}</td>
         <td>${esc(c.position)}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-        <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}`}<div>${explainBtn(c, 'detail')}</div></td>
-        <td class="mono">${skipped ? '—' : c.schedEndText}</td>
+        <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}${pauseHoldTag(c)}`}<div>${explainBtn(c, 'detail')}</div></td>
+        <td class="mono">${skipped ? '—' : `${c.schedEndText}${pauseShiftTag(c)}`}</td>
         <td>${statusBadge(c.status)}</td>
         <td>${releaseCell(c)}</td>
         <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>

@@ -261,7 +261,56 @@ function versionInputs(versionId) {
       sourceVersionId: r.source_version_id, sourceCueRef: r.source_cue_ref,
     });
   }
-  return { cues, deps, regMap };
+  // 联排中断记录（按时间先后）；resume_minute 为 NULL 的为当前进行中的停排
+  const interruptions = db.prepare(
+    `SELECT id, pause_minute, reason, paused_by, paused_at, resume_minute, resumed_by, resumed_at
+     FROM rehearsal_interruptions WHERE version_id = ? ORDER BY id`
+  ).all(versionId).map((it) => ({
+    id: it.id,
+    pauseMinute: it.pause_minute,
+    reason: it.reason,
+    pausedBy: it.paused_by,
+    pausedAt: it.paused_at,
+    resumeMinute: it.resume_minute,
+    resumedBy: it.resumed_by,
+    resumedAt: it.resumed_at,
+  }));
+  return { cues, deps, regMap, interruptions };
+}
+
+// 当前进行中的停排（同版至多一段；无则 null）
+function activeInterruption(versionId) {
+  return db.prepare(
+    'SELECT * FROM rehearsal_interruptions WHERE version_id = ? AND resume_minute IS NULL'
+  ).get(versionId) || null;
+}
+
+// 某时刻是否落入该版本任一段停排区间（半开 [pause, resume)；进行中的停排以 [pause, +∞) 处理）
+function timeInAnyInterruption(versionId, minute) {
+  return db.prepare(
+    'SELECT id, pause_minute, resume_minute FROM rehearsal_interruptions WHERE version_id = ?'
+  ).all(versionId).some((it) =>
+    minute >= it.pause_minute && (it.resume_minute === null || minute < it.resume_minute));
+}
+
+// 联排中断记录 JSON（现场与历史回看共用）
+function interruptionJson(it) {
+  return {
+    id: it.id,
+    pauseMinute: it.pauseMinute ?? it.pause_minute,
+    pauseText: minToTime(it.pauseMinute ?? it.pause_minute),
+    reason: it.reason,
+    pausedBy: it.pausedBy ?? it.paused_by,
+    pausedAt: it.pausedAt ?? it.paused_at,
+    resumeMinute: it.resumeMinute ?? it.resume_minute ?? null,
+    resumeText: minToTime(it.resumeMinute ?? it.resume_minute ?? null),
+    resumedBy: it.resumedBy ?? it.resumed_by ?? null,
+    resumedAt: it.resumedAt ?? it.resumed_at ?? null,
+    durationMinutes: (it.resumeMinute ?? it.resume_minute) != null
+      ? (it.resumeMinute ?? it.resume_minute) - (it.pauseMinute ?? it.pause_minute)
+      : null,
+    active: (it.resumeMinute ?? it.resume_minute) == null,
+  };
 }
 
 // 某版本全部放行签认记录（含已失效），按提示项分组；每条含直接前置行版本快照
@@ -330,7 +379,7 @@ function releaseViewOf(records) {
 }
 
 function versionPayload(versionRow) {
-  const { cues, deps, regMap } = versionInputs(versionRow.id);
+  const { cues, deps, regMap, interruptions } = versionInputs(versionRow.id);
 
   // 依赖链跳过留痕（每项至多一条）：操作者、时间、原因、触发根项
   const skipMap = new Map();
@@ -344,7 +393,7 @@ function versionPayload(versionRow) {
     skippedAt: s.skipped_at,
   }));
 
-  const live = computeLive(cues, deps, regMap);
+  const live = computeLive(cues, deps, regMap, interruptions);
   const latestId = (db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m);
 
   // 放行签认：cue_ref -> 该提示项全部签认记录（含已失效，按 id 升序）
@@ -403,6 +452,10 @@ function versionPayload(versionRow) {
       actualStartText: minToTime(c.actualStart),
       actualEndText: minToTime(c.actualEnd),
       estimatedEndText: minToTime(c.estimatedEnd),
+      // 联排中断对该项的影响：已开始项推算/预计结束顺延分钟；未开始项被「不得早于」最近恢复/停排时刻托住
+      interrupted: c.interrupted === true,
+      pauseShiftMinutes: c.pauseShift || 0,
+      pauseHoldText: minToTime(c.pauseHold),
       corrections: corrMap.get(c.id) || [],
       skip: (() => {
         const s = skipMap.get(c.id);
@@ -433,6 +486,12 @@ function versionPayload(versionRow) {
     })),
     conflicts: live.conflicts,
     orderProblem: live.orderProblem,
+    // 联排中断：全部停排记录（含已恢复，留痕回看）与当前进行中的停排（无则 null）
+    interruptions: interruptions.map(interruptionJson),
+    activeInterruption: (() => {
+      const active = interruptions.find((it) => it.resumeMinute == null);
+      return active ? interruptionJson(active) : null;
+    })(),
   };
 }
 
@@ -822,6 +881,15 @@ app.post('/api/publish', requireSM, (req, res, next) => {
         }
       }
 
+      // 发布新版前必须先恢复当前执行版进行中的停排（停排期间不允许发布新版）
+      const beforeLatest = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      const beforeActive = beforeLatest ? activeInterruption(beforeLatest.id) : null;
+      if (beforeActive) {
+        throw new ApiError(409, 'INTERRUPTION_ACTIVE',
+          `第 ${beforeLatest.version_no} 版当前处于停排中（${minToTime(beforeActive.pause_minute)} 起），请先由舞监恢复联排后再发布新版`,
+          { currentVersionId: beforeLatest.id, currentVersionNo: beforeLatest.version_no });
+      }
+
       if (!validation.ok) {
         throw new ApiError(422, 'PUBLISH_CONFLICT', '存在冲突项，无法发布联排版本', { errors: validation.errors });
       }
@@ -884,13 +952,18 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
               (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id
                  AND (r.actual_start IS NOT NULL OR r.actual_end IS NOT NULL OR r.estimated_end IS NOT NULL)) AS reg_count,
               (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id AND r.skipped = 1) AS skip_count,
+              (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id) AS interruption_count,
+              (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id AND i.resume_minute IS NULL) AS interruption_active_count,
               (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count
        FROM rehearsal_versions v ORDER BY v.version_no DESC`
     ).all();
     res.json({
       versions: rows.map((r) => ({
         id: r.id, versionNo: r.version_no, note: r.note,
-        createdAt: r.created_at, regCount: r.reg_count, skipCount: r.skip_count, cueCount: r.cue_count,
+        createdAt: r.created_at, regCount: r.reg_count, skipCount: r.skip_count,
+        interruptionCount: r.interruption_count,
+        interruptionActive: r.interruption_active_count > 0,
+        cueCount: r.cue_count,
       })),
     });
   } catch (e) { next(e); }
@@ -920,12 +993,12 @@ app.get('/api/versions/:id/cues/:cueRef/explain', requireAuth, (req, res, next) 
     const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id = ? AND cue_ref = ?').get(ver.id, cueRef);
     if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
 
-    const { cues, deps, regMap } = versionInputs(ver.id);
+    const { cues, deps, regMap, interruptions } = versionInputs(ver.id);
     const skipReasons = new Map();
     db.prepare('SELECT cue_ref, reason FROM registration_skips WHERE version_id = ?')
       .all(ver.id).forEach((s) => skipReasons.set(s.cue_ref, s.reason));
 
-    const explain = explainSchedule(cues, deps, regMap, cueRef, skipReasons);
+    const explain = explainSchedule(cues, deps, regMap, cueRef, skipReasons, interruptions);
     if (explain.notFound) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
     const latestNo = db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m;
     res.json({
@@ -1099,6 +1172,13 @@ app.post('/api/live/signoffs', requireAuth, (req, res, next) => {
         throw new ApiError(409, 'SIGNOFF_STATE',
           `「${pc.code}」已${reg.actual_end !== null ? '完成' : '开始'}，不能再签认（签认仅在登记实际开始之前有效）`);
       }
+      // 停排期间不接受新签认（停排前有效双签已在停排时整体失效，须恢复后重签）
+      const activePauseForSignoff = activeInterruption(versionId);
+      if (activePauseForSignoff) {
+        throw new ApiError(409, 'INTERRUPTION_ACTIVE',
+          `第 ${verRow.version_no} 版当前处于停排中（${minToTime(activePauseForSignoff.pause_minute)} 起），停排期间不能签认；恢复联排后请双方重新签认`,
+          { pauseText: minToTime(activePauseForSignoff.pause_minute) });
+      }
       if (rowVersion !== reg.row_ver) {
         throw new ApiError(409, 'VERSION_CONFLICT',
           `「${pc.code}」登记已被更新：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
@@ -1190,6 +1270,13 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
       if (reg.skipped === 1) {
         throw new ApiError(409, 'CUE_SKIPPED',
           `「${pc.code}」已被舞监标记为跳过（不再执行），执行岗位不能登记；请刷新页面`);
+      }
+      // 联排停排期间：执行账号的开始 / 预计结束 / 完成登记一律拒绝（须先由舞监恢复）
+      const activePause = activeInterruption(versionId);
+      if (activePause) {
+        throw new ApiError(409, 'INTERRUPTION_ACTIVE',
+          `第 ${verRow.version_no} 版当前处于停排中（${minToTime(activePause.pause_minute)} 起，原因：${activePause.reason}），停排期间不能登记开始 / 预计结束 / 完成，请等待舞监恢复联排后再登记`,
+          { pauseText: minToTime(activePause.pause_minute) });
       }
       if (rowVersion !== reg.row_ver) {
         throw new ApiError(409, 'VERSION_CONFLICT',
@@ -1334,6 +1421,17 @@ app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
       if (next.actual_end !== null && next.actual_end < next.actual_start) {
         throw new ApiError(400, 'BAD_INPUT',
           `实际完成 ${minToTime(next.actual_end)} 早于实际开始 ${minToTime(next.actual_start)}`);
+      }
+
+      // 联排中断：更正后的实际开始 / 实际完成时刻不得落入任何停排区间（半开 [停排, 恢复)）；
+      // 预计结束为计划值不受此限。停排期间舞监更正本身仍可办理（此项不阻止）。
+      if (next.actual_start !== null && timeInAnyInterruption(versionId, next.actual_start)) {
+        throw new ApiError(400, 'INTERRUPTION_TIME_CONFLICT',
+          `更正后的实际开始 ${minToTime(next.actual_start)} 落入联排停排区间，停排期间没有实际执行，请改为停排前或恢复后的时刻`);
+      }
+      if (next.actual_end !== null && timeInAnyInterruption(versionId, next.actual_end)) {
+        throw new ApiError(400, 'INTERRUPTION_TIME_CONFLICT',
+          `更正后的实际完成 ${minToTime(next.actual_end)} 落入联排停排区间，停排期间没有实际执行，请改为停排前或恢复后的时刻`);
       }
 
       // 保留的预计结束不得早于实际开始（无实际开始则为原计划开始）
@@ -1735,7 +1833,7 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
           { currentVersionId: latest.id, currentVersionNo: latest.version_no });
       }
 
-      const { cues, deps, regMap } = versionInputs(ver.id);
+      const { cues, deps, regMap, interruptions } = versionInputs(ver.id);
       const cueById = new Map(cues.map((c) => [c.id, c]));
       const readAt = new Date().toLocaleString('sv-SE');
 
@@ -1776,8 +1874,8 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
           { items: stale, currentVersionId: latest.id, currentVersionNo: latest.version_no });
       }
 
-      // 以同一快照为基线一次性套用全部假设并重算
-      const sim = simulateWhatIf(cues, deps, regMap, assumptionsParsed);
+      // 以同一快照为基线一次性套用全部假设并重算（联排中断顺延规则一致）
+      const sim = simulateWhatIf(cues, deps, regMap, assumptionsParsed, interruptions);
       if (sim.orderProblem) {
         throw new ApiError(409, 'WHATIF_ORDER_PROBLEM', `已发布数据检测到依赖环，无法预演：${sim.orderProblem}`);
       }
@@ -1808,6 +1906,202 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
       conflictsRemoved: sim.conflictsRemoved,
       conflictsKept: sim.conflictsKept,
       summary: sim.summary,
+    });
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：联排中断（停排 / 恢复，仅当前执行版） ----------
+
+// 停排：为当前执行版填写当日 HH:MM 停排时刻与非空原因。
+// 同事务校验：当前执行版、无进行中的停排、时刻不得覆盖任何已登记的实际开始/实际完成；
+// 停排生效时清除全部「未开始且未跳过」项的预计结束（推进这些登记行版本并留更正痕迹），
+// 停排前的有效双签整体失效（保留原因），恢复后须重签。整体校验失败不留任何部分记录。
+app.post('/api/live/interruptions', requireSM, (req, res, next) => {
+  try {
+    const versionId = Number(req.body.versionId);
+    const pauseMinute = timeToMin(req.body.pauseText);
+    const reason = String(req.body.reason || '').trim();
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
+    if (pauseMinute === null) throw new ApiError(400, 'BAD_INPUT', '停排时刻格式应为 HH:MM');
+    if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写停排原因（不能为空）');
+    if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '停排原因不能超过 200 字');
+
+    const result = db.transaction(() => {
+      const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = latestPublishedVersion();
+      if (!latest || latest.id !== verRow.id) {
+        throw new ApiError(409, 'VERSION_ARCHIVED',
+          `第 ${verRow.version_no} 版已不是当前执行版本（已有新版本发布），请刷新使用当前执行版本停排`);
+      }
+      if (activeInterruption(versionId)) {
+        throw new ApiError(409, 'INTERRUPTION_EXISTS',
+          `第 ${verRow.version_no} 版已有一段进行中的停排，请先恢复后再发起新的停排`);
+      }
+
+      // 停排时刻必须递增且不得覆盖已登记的实际开始 / 实际完成（半开：恢复时刻另校验）
+      const prior = db.prepare(
+        'SELECT MAX(resume_minute) AS m FROM rehearsal_interruptions WHERE version_id = ?'
+      ).get(versionId).m;
+      if (prior !== null && pauseMinute <= prior) {
+        throw new ApiError(400, 'INTERRUPTION_TIME_INVALID',
+          `停排时刻 ${minToTime(pauseMinute)} 不晚于最近一次恢复时刻 ${minToTime(prior)}，时刻必须严格递增`);
+      }
+      const covered = db.prepare(
+        `SELECT cue_ref, actual_start, actual_end FROM registrations
+         WHERE version_id = ? AND skipped = 0
+           AND ((actual_start IS NOT NULL AND actual_start >= ?)
+             OR (actual_end  IS NOT NULL AND actual_end  >= ?))`
+      ).all(versionId, pauseMinute, pauseMinute);
+      if (covered.length) {
+        const cueCode = (ref) => db.prepare('SELECT code FROM published_cues WHERE version_id=? AND cue_ref=?')
+          .get(versionId, ref)?.code || `#${ref}`;
+        const items = covered.map((r) => {
+          const parts = [];
+          if (r.actual_start !== null && r.actual_start >= pauseMinute) parts.push(`实际开始 ${minToTime(r.actual_start)}`);
+          if (r.actual_end !== null && r.actual_end >= pauseMinute) parts.push(`实际完成 ${minToTime(r.actual_end)}`);
+          return { cueRef: r.cue_ref, code: cueCode(r.cue_ref),
+            reason: `「${cueCode(r.cue_ref)}」${parts.join('、')}不早于停排时刻 ${minToTime(pauseMinute)}，停排不能覆盖已登记的实际时刻` };
+        });
+        throw new ApiError(400, 'INTERRUPTION_TIME_CONFLICT',
+          `停排时刻 ${minToTime(pauseMinute)} 会覆盖 ${covered.length} 项已登记的实际开始 / 完成，请核对时刻`,
+          { items });
+      }
+
+      const stamp = new Date().toLocaleString('sv-SE');
+      const actor = req.session.user.displayName;
+
+      // 清除未开始（无实际开始/完成）且未跳过项的预计结束：推进其登记行版本并留更正痕迹
+      const pendingRows = db.prepare(
+        `SELECT * FROM registrations
+         WHERE version_id = ? AND skipped = 0 AND actual_start IS NULL AND actual_end IS NULL
+           AND estimated_end IS NOT NULL`
+      ).all(versionId);
+      const insCorr = db.prepare(
+        `INSERT INTO registration_corrections(version_id, cue_ref, field, old_value, new_value, reason, cascaded, group_id, corrected_by, corrected_at)
+         VALUES (?, ?, 'estimated_end', ?, NULL, ?, 0, NULL, ?, ?)`
+      );
+      const clearStmt = db.prepare(
+        `UPDATE registrations SET estimated_end = NULL, row_ver = row_ver + 1, updated_by = ?, updated_at = ?
+         WHERE id = ?`
+      );
+      const clearReason = `联排于 ${minToTime(pauseMinute)} 停排（${reason}），停排时清除未开始项原预计结束`;
+      let clearedCount = 0;
+      for (const r of pendingRows) {
+        insCorr.run(versionId, r.cue_ref, r.estimated_end, clearReason, actor, stamp);
+        clearStmt.run(actor, stamp, r.id);
+        clearedCount += 1;
+      }
+
+      // 停排记录（同版至多一段进行中：部分唯一索引兜底）
+      const info = db.prepare(
+        `INSERT INTO rehearsal_interruptions(version_id, pause_minute, reason, paused_by, paused_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(versionId, pauseMinute, reason, actor, stamp);
+
+      // 停排前的有效双签整体失效（保留记录与原因，恢复后须重签）
+      db.prepare(
+        `UPDATE release_signoffs SET active = 0,
+           invalidated_reason = ?, invalidated_at = ?
+         WHERE version_id = ? AND active = 1`
+      ).run(`联排于 ${minToTime(pauseMinute)} 停排（${reason}），停排前双签失效，须恢复后重新签认`, stamp, versionId);
+
+      return { verRow, interruptionId: info.lastInsertRowid, clearedCount };
+    })();
+
+    const payload = versionPayload(result.verRow);
+    res.status(201).json({
+      version: payload,
+      interruption: payload.activeInterruption,
+      clearedEstimatedEnds: result.clearedCount,
+    });
+  } catch (e) {
+    if (String(e.code || '').includes('SQLITE_CONSTRAINT')) {
+      return next(new ApiError(409, 'INTERRUPTION_EXISTS', '该版本已有一段进行中的停排，请先恢复后再发起新的停排'));
+    }
+    next(e);
+  }
+});
+
+// 恢复：为进行中的停排补记恢复时刻（HH:MM，严格晚于停排时刻、不早于最近一次恢复时刻）。
+// 恢复本身不改写任何实际登记时间；未开始项重算开始不早于本次恢复时刻，
+// 已开始未完成项推算/预计结束顺延该段中断分钟且不早于恢复时刻，依赖顺延与岗位冲突随之重算。
+app.post('/api/live/interruptions/resume', requireSM, (req, res, next) => {
+  try {
+    const versionId = Number(req.body.versionId);
+    const resumeMinute = timeToMin(req.body.resumeText);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
+    if (resumeMinute === null) throw new ApiError(400, 'BAD_INPUT', '恢复时刻格式应为 HH:MM');
+
+    const verRow = db.transaction(() => {
+      const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = latestPublishedVersion();
+      if (!latest || latest.id !== verRow.id) {
+        throw new ApiError(409, 'VERSION_ARCHIVED',
+          `第 ${verRow.version_no} 版已不是当前执行版本（已有新版本发布），请刷新使用当前执行版本恢复`);
+      }
+      const active = activeInterruption(versionId);
+      if (!active) {
+        throw new ApiError(409, 'NO_ACTIVE_INTERRUPTION',
+          `第 ${verRow.version_no} 版当前没有进行中的停排，无需恢复（重复恢复已整体拒绝）`);
+      }
+      if (resumeMinute <= active.pause_minute) {
+        throw new ApiError(400, 'INTERRUPTION_TIME_INVALID',
+          `恢复时刻 ${minToTime(resumeMinute)} 不晚于停排时刻 ${minToTime(active.pause_minute)}，时刻必须严格递增`);
+      }
+      // 恢复时刻同样不得覆盖已登记的实际开始 / 完成（停排期间执行登记被拒绝，此处双保险）
+      const covered = db.prepare(
+        `SELECT cue_ref, actual_start, actual_end FROM registrations
+         WHERE version_id = ? AND skipped = 0
+           AND ((actual_start IS NOT NULL AND actual_start >= ?)
+             OR (actual_end  IS NOT NULL AND actual_end  >= ?))`
+      ).all(versionId, resumeMinute, resumeMinute);
+      if (covered.length) {
+        const cueCode = (ref) => db.prepare('SELECT code FROM published_cues WHERE version_id=? AND cue_ref=?')
+          .get(versionId, ref)?.code || `#${ref}`;
+        const items = covered.map((r) => {
+          const parts = [];
+          if (r.actual_start !== null && r.actual_start >= resumeMinute) parts.push(`实际开始 ${minToTime(r.actual_start)}`);
+          if (r.actual_end !== null && r.actual_end >= resumeMinute) parts.push(`实际完成 ${minToTime(r.actual_end)}`);
+          return { cueRef: r.cue_ref, code: cueCode(r.cue_ref),
+            reason: `「${cueCode(r.cue_ref)}」${parts.join('、')}不早于恢复时刻 ${minToTime(resumeMinute)}，恢复不能覆盖已登记的实际时刻` };
+        });
+        throw new ApiError(400, 'INTERRUPTION_TIME_CONFLICT',
+          `恢复时刻 ${minToTime(resumeMinute)} 会覆盖 ${covered.length} 项已登记的实际时刻，请核对时刻`,
+          { items });
+      }
+
+      const stamp = new Date().toLocaleString('sv-SE');
+      db.prepare(
+        'UPDATE rehearsal_interruptions SET resume_minute = ?, resumed_by = ?, resumed_at = ? WHERE id = ?'
+      ).run(resumeMinute, req.session.user.displayName, stamp, active.id);
+      return verRow;
+    })();
+
+    const payload = versionPayload(verRow);
+    const rec = payload.interruptions.find((it) => it.active === false && it.resumeText === minToTime(resumeMinute));
+    res.json({
+      version: payload,
+      interruption: rec || null,
+    });
+  } catch (e) { next(e); }
+});
+
+// 当前执行版停排记录查询（全部留痕，最新在前；进行中置首）
+app.get('/api/live/interruptions', requireAuth, (req, res, next) => {
+  try {
+    const ver = latestPublishedVersion();
+    if (!ver) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本');
+    const rows = db.prepare(
+      'SELECT * FROM rehearsal_interruptions WHERE version_id = ? ORDER BY id DESC'
+    ).all(ver.id);
+    res.json({
+      versionId: ver.id,
+      versionNo: ver.version_no,
+      activeInterruption: rows.find((r) => r.resume_minute === null)
+        ? interruptionJson(rows.find((r) => r.resume_minute === null)) : null,
+      interruptions: rows.map(interruptionJson),
     });
   } catch (e) { next(e); }
 });

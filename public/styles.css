@@ -189,3 +189,25 @@ tr.wi-assumed-row td { border-left: 3px solid #2f6fed; }
 .signoff-invalid { color: #b3541e; font-weight: 600; }
 .signoff-reason { white-space: normal; max-width: 220px; }
 .signoff-ready { font-size: 12px; color: #1d7a43; background: #e2f5e9; border-radius: 6px; padding: 1px 8px; }
+
+/* 联排中断（停排 / 恢复） */
+.pause-banner { background: #f6ecff; border: 1px solid #b58be0; color: #5b2a8f; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; }
+.pause-banner-title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+.pause-banner .muted { color: #7b6396; margin-top: 4px; }
+.pause-resumed-banner { background: #eef7f1; border: 1px solid #9ed3b3; color: #1d6b43; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }
+.pause-active-box { background: #faf4ff; border: 1px dashed #b58be0; border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+.pause-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; margin: 10px 0; }
+.pause-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.pause-reason-label { flex: 1 1 280px; }
+.pause-reason-label textarea { width: 100%; }
+.pause-history { margin-top: 10px; font-size: 12.5px; }
+.pause-history ul { margin: 6px 0 0; padding-left: 18px; }
+.pause-history li { margin: 4px 0; line-height: 1.6; }
+.pause-locked { display: inline-block; color: #5b2a8f; background: #f0e3fb; border: 1px solid #c9a3ea; border-radius: 6px; padding: 1px 8px; font-size: 12px; font-weight: 600; }
+.pause-hold { font-size: 11px; color: #5b2a8f; }
+.pause-shift { font-size: 11px; color: #b3541e; }
+tr.interrupted-row td { background: #faf4ff; }
+tr.interrupted-row:hover td { background: #f4e8ff; }
+.pause-count { color: #5b2a8f; font-weight: 600; }
+.pause-count-active { background: #f0e3fb; border: 1px solid #c9a3ea; border-radius: 6px; padding: 0 6px; }
+tr.pause-row-active td { background: #faf4ff; }

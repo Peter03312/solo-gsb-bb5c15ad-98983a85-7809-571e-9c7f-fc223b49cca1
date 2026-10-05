@@ -156,6 +156,20 @@ CREATE TABLE IF NOT EXISTS release_signoffs (
   invalidated_at TEXT
 );
 
+-- 联排中断（停排/恢复）：按版本记录每段停排；同版至多一段进行中（resume_minute IS NULL）。
+-- 停排时登记当日 HH:MM（分钟）与非空原因，恢复时补记恢复时刻；记录永久留存，供历史版回看。
+CREATE TABLE IF NOT EXISTS rehearsal_interruptions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id    INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  pause_minute  INTEGER NOT NULL,          -- 停排开始时刻（当日 00:00 起分钟数）
+  reason        TEXT NOT NULL,             -- 非空停排原因
+  paused_by     TEXT NOT NULL,             -- 停排操作人（舞监）
+  paused_at     TEXT NOT NULL,             -- 停排操作时间戳
+  resume_minute INTEGER,                   -- 恢复时刻（NULL = 停排进行中）
+  resumed_by    TEXT,
+  resumed_at    TEXT
+);
+
 -- 签认时直接前置项登记行版本快照（任一变化即失效）
 CREATE TABLE IF NOT EXISTS release_signoff_preds (
   signoff_id  INTEGER NOT NULL REFERENCES release_signoffs(id) ON DELETE CASCADE,
@@ -169,6 +183,10 @@ CREATE INDEX IF NOT EXISTS idx_corr_version ON registration_corrections(version_
 CREATE INDEX IF NOT EXISTS idx_deputies_version ON position_deputies(version_id);
 CREATE INDEX IF NOT EXISTS idx_skips_version ON registration_skips(version_id);
 CREATE INDEX IF NOT EXISTS idx_signoffs_version ON release_signoffs(version_id);
+CREATE INDEX IF NOT EXISTS idx_interruptions_version ON rehearsal_interruptions(version_id);
+-- 同一版本至多一段进行中的停排（部分唯一索引：resume_minute IS NULL 即进行中）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_interruptions_active
+  ON rehearsal_interruptions(version_id) WHERE resume_minute IS NULL;
 CREATE INDEX IF NOT EXISTS idx_signoff_preds_signoff ON release_signoff_preds(signoff_id);
 CREATE INDEX IF NOT EXISTS idx_signoff_preds_cue ON release_signoff_preds(cue_ref);
 -- 每个版本每个岗位至多一名在任代班（部分唯一索引）
