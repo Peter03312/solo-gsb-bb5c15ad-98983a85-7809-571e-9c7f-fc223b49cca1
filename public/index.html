@@ -125,8 +125,20 @@
           <button id="live-reload" class="ghost">刷新</button>
         </div>
         <div id="live-meta" class="panel"></div>
+        <div id="live-suspension-banner"></div>
         <div id="live-conflicts"></div>
         <div id="live-deputy-banner"></div>
+        <div class="panel" id="suspension-panel" hidden>
+          <h3>联排中断停排 / 恢复（仅当前执行版 · 舞监）</h3>
+          <p class="muted">
+            联排中断时由舞监为<strong>当前执行版</strong>填写当日 <strong>HH:MM 停排时刻与非空原因</strong>停排，再填写<strong>恢复时刻</strong>恢复联排。
+            同版只能有一段进行中的停排；时刻必须严格递增，且不得覆盖已登记的实际开始 / 完成。
+            停排期间执行账号的开始、预计结束、完成登记与新签认均被拒绝，发布新版也须先恢复；舞监仍可办理更正（更正后的实际时刻不得落入停排区间）与跳过。
+            恢复后：未开始项重算开始不早于恢复时刻（停排时已清除其既有预计结束并推进行版本）；已开始未完成项的按时长推算结束与停排前预计结束顺延该段中断分钟，实际登记时间不改；
+            停排前的有效双签停排时失效（保留原因），恢复后须重签方可开始。
+          </p>
+          <div id="suspension-body"></div>
+        </div>
         <div class="panel" id="deputy-panel" hidden>
           <h3>岗位代班（仅当前执行版）</h3>
           <p class="muted">
@@ -201,7 +213,7 @@
         <div class="panel">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>操作</th></tr></thead>
+              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>停排段</th><th>操作</th></tr></thead>
               <tbody id="versions-tbody"></tbody>
             </table>
           </div>

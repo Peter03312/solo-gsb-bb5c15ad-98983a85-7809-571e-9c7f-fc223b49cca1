@@ -558,6 +558,8 @@ function renderLive() {
     $('#live-deputy-banner').innerHTML = '';
     $('#deputy-panel').hidden = true;
     $('#whatif-panel').hidden = true;
+    $('#suspension-panel').hidden = true;
+    $('#live-suspension-banner').innerHTML = '';
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -567,6 +569,7 @@ function renderLive() {
   renderConflicts(v.conflicts);
   renderDeputyBanner(v);
   renderDeputyPanel(v);
+  renderSuspension(v);
 
   const isOp = state.me.role === 'operator';
   const isSM = state.me.role === 'sm';
@@ -595,7 +598,9 @@ function renderLive() {
         ? `<div class="corr-actions"><button class="ghost tiny" data-act="open-skip-view" data-cue="${c.id}">跳过原因</button>${histBtn}</div>`
         : '<span class="muted">已跳过</span>';
     } else if (canReg && mine) {
-      reg = renderRegControls(c);
+      reg = state.live.suspension?.active
+        ? '<span class="sus-reg-closed">⛔ 停排中，暂停登记</span>'
+        : renderRegControls(c);
     } else if (mine && isOp) {
       reg = '<span class="muted">本岗位（版本已归档）</span>';
     } else if (isOp && c.position === myPos && activeDepByPos.has(c.position)) {
@@ -699,6 +704,121 @@ $('#deputy-tbody').addEventListener('click', async (ev) => {
   } catch (e) {
     alertBar('error', errorToHtml(e));
     if (e.status === 409) loadLive().catch(() => {});
+  }
+});
+
+// ---------- 联排中断停排 / 恢复 ----------
+
+function suspensionHistoryRows(history) {
+  if (!history.length) return '<tr><td colspan="6" class="muted">本版尚无停排记录。</td></tr>';
+  return history.map((h) => `<tr${h.active ? ' class="sus-active-row"' : ''}>
+    <td class="mono">#${h.seq}</td>
+    <td class="mono">${esc(h.suspendTimeText)}</td>
+    <td class="mono">${h.active ? '<span class="badge running">进行中</span>' : esc(h.resumeTimeText)}</td>
+    <td class="mono">${h.active ? '—' : `${h.durationMinutes} 分`}</td>
+    <td>${esc(h.reason)}<div class="muted mono">停排：${esc(h.suspendedBy)} ${esc(h.suspendedAt)}${h.active ? '' : `<br>恢复：${esc(h.resumedBy || '')} ${esc(h.resumedAt || '')}`}</div></td>
+    <td>${h.active ? '<span class="sus-active-tag">停排中</span>' : '<span class="muted">已恢复</span>'}</td>
+  </tr>`).join('');
+}
+
+// 停排横幅：停排中对所有现场角色醒目提示；恢复后汇总本版中断分钟
+function renderSuspensionBanner(v) {
+  const box = $('#live-suspension-banner');
+  const s = v.suspension;
+  if (!s) { box.innerHTML = ''; return; }
+  if (s.active) {
+    box.innerHTML = `<div class="suspension-banner">
+      <strong>⛔ 联排停排中</strong>：自 <strong class="mono">${esc(s.active.suspendTimeText)}</strong> 起停排，
+      原因：${esc(s.active.reason)}（${esc(s.active.suspendedBy)} 登记于 ${esc(s.active.suspendedAt)}）。
+      停排期间执行账号的开始 / 预计结束 / 完成登记与新签认均暂停，发布新版须先恢复；
+      未开始项既有预计结束已清除，停排前有效双签已失效，恢复后须重签。
+    </div>`;
+    return;
+  }
+  if (s.completedCount > 0) {
+    box.innerHTML = `<div class="suspension-resumed-banner">
+      ✅ 联排已恢复（最近恢复时刻 <strong class="mono">${esc(s.latestResumeTimeText)}</strong>）；
+      本版共停排 ${s.completedCount} 段、累计中断 <strong>${s.totalInterruptMinutes}</strong> 分钟，
+      未开始项重算开始不早于最近恢复时刻，已开始未完成项结束已顺延。
+    </div>`;
+  } else {
+    box.innerHTML = '';
+  }
+}
+
+function renderSuspension(v) {
+  renderSuspensionBanner(v);
+  const panel = $('#suspension-panel');
+  const isSM = state.me?.role === 'sm';
+  panel.hidden = !isSM || !v || !v.isLatest;
+  if (panel.hidden) return;
+  const s = v.suspension || { active: null, history: [], totalInterruptMinutes: 0, completedCount: 0 };
+  const formHtml = s.active
+    ? `<form id="sus-resume-form" class="sus-form">
+        <div class="sus-now">
+          <span class="sus-active-tag">⛔ 进行中：第 #${s.active.seq} 段</span>
+          ${esc(s.active.suspendTimeText)} 起停排｜${esc(s.active.reason)}
+        </div>
+        <label>恢复时刻（HH:MM，必须晚于停排时刻）
+          <input type="time" name="resumeTimeText" required />
+        </label>
+        <button type="submit" class="primary">填写恢复时刻，恢复联排</button>
+        <span class="muted">恢复后未开始项不早于该时刻重算；运行中项结束顺延 ${s.active.suspendTimeText} 起的中断分钟。</span>
+      </form>`
+    : `<form id="sus-start-form" class="sus-form">
+        <label>停排时刻（HH:MM）
+          <input type="time" name="suspendTimeText" required />
+        </label>
+        <label>停排原因（必填，≤200 字）
+          <input type="text" name="reason" maxlength="200" required placeholder="如：设备故障、演员受伤处理" />
+        </label>
+        <button type="submit" class="danger">登记停排</button>
+        <span class="muted">须晚于上一段恢复时刻${s.latestResumeTimeText ? `（${esc(s.latestResumeTimeText)}）` : ''}，且不得覆盖已登记的实际开始 / 完成。</span>
+      </form>`;
+  $('#suspension-body').innerHTML = `
+    <div class="muted">本版已累计中断 ${s.totalInterruptMinutes} 分钟（${s.completedCount} 段已恢复）。</div>
+    ${formHtml}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>停排时刻</th><th>恢复时刻</th><th>中断</th><th>原因 / 操作者</th><th>状态</th></tr></thead>
+        <tbody>${suspensionHistoryRows(s.history)}</tbody>
+      </table>
+    </div>`;
+}
+
+$('#suspension-panel').addEventListener('submit', async (ev) => {
+  const f = ev.target.closest('#sus-start-form, #sus-resume-form');
+  if (!f) return;
+  ev.preventDefault();
+  const v = state.live;
+  if (!v) return;
+  try {
+    if (f.id === 'sus-start-form') {
+      const suspendTimeText = f.elements.suspendTimeText.value;
+      const reason = f.elements.reason.value.trim();
+      if (!suspendTimeText || !reason) return alertBar('error', '请填写停排时刻与非空原因');
+      if (!confirm(`确认自 ${suspendTimeText} 起停排？\n停排后执行账号的开始/预计结束/完成登记与新签认将被拒绝，未开始项既有预计结束将清除，停排前有效双签将失效；发布新版须先恢复。`)) return;
+      const data = await api('POST', '/api/live/suspensions', { versionId: v.id, suspendTimeText, reason });
+      state.live = data.version;
+      alertBar('error',
+        `⛔ 已登记停排（${data.suspension.suspendTimeText} 起，原因：${reason}）。清除 ${data.suspension.clearedEstimateRows} 行未开始项预计结束，停排前有效双签已失效。`,
+        10000);
+      renderLive();
+    } else {
+      const resumeTimeText = f.elements.resumeTimeText.value;
+      if (!resumeTimeText) return alertBar('error', '请填写恢复时刻');
+      const data = await api('POST', '/api/live/suspensions/resume', { versionId: v.id, resumeTimeText });
+      state.live = data.version;
+      const n = data.suspension.shiftedRows.length;
+      alertBar('ok',
+        `✅ 已于 ${resumeTimeText} 恢复联排，本段中断 ${data.suspension.durationMinutes} 分钟。`
+        + (n ? ` ${n} 个运行中项的预计结束已顺延并物化。` : ' 未开始项重算开始不早于恢复时刻。'),
+        10000);
+      renderLive();
+    }
+  } catch (e) {
+    alertBar('error', errorToHtml(e), 9000);
+    if (e.status === 409) loadLive().then(renderLive).catch(() => {});
   }
 });
 
@@ -826,8 +946,9 @@ function renderCorrectionCell(c, v, scope) {
     || (v.isLatest && scope === 'live' && c.status === 'RUNNING')
     ? `<button class="ghost tiny" data-act="open-whatif" data-cue="${c.id}">顺延预演</button>`
     : '';
-  // 需放行项：舞监签认「可执行」（仅当前执行版、未开始项；签认不推进行版本）
-  const signoffBtn = (v.isLatest && scope === 'live' && c.release?.required && c.status === 'PENDING' && c.release.sm.state !== 'valid')
+  // 需放行项：舞监签认「可执行」（仅当前执行版、未开始项；停排期间拒绝新签认，按钮隐藏；签认不推进行版本）
+  const signoffBtn = (v.isLatest && scope === 'live' && c.release?.required && c.status === 'PENDING'
+      && c.release.sm.state !== 'valid' && !v.suspension?.active)
     ? `<button class="warn tiny" data-signoff="sm" data-cue="${c.id}" data-ver="${c.rowVer}" data-version-id="${v.id}">签认可执行</button>`
     : '';
   const corrBtn = v.isLatest && scope === 'live'
@@ -1435,9 +1556,10 @@ function renderVersions() {
       <td>${v.cueCount}</td>
       <td>${v.regCount}</td>
       <td>${v.skipCount ? `<span class="skip-count">⛔ ${v.skipCount}</span>` : 0}</td>
+      <td>${v.suspensionCount ? `<span class="sus-count" title="已恢复停排段数">⏸ ${v.suspensionCount}</span>` : 0}</td>
       <td><button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button></td>
     </tr>`).join('')
-    || '<tr><td colspan="7" class="muted">暂无已发布版本。</td></tr>';
+    || '<tr><td colspan="8" class="muted">暂无已发布版本。</td></tr>';
 }
 
 $('#versions-tbody').addEventListener('click', async (ev) => {
@@ -1500,12 +1622,22 @@ function renderDetail() {
             <td class="mono">${d.active ? '—' : `${esc(d.revokedBy || '')}<br>${esc(d.revokedAt || '')}`}</td>
           </tr>`).join('')}</tbody>
         </table></div></div>` : '';
+  // 停排记录只读回看（含进行中与已恢复段；旧版只读）
+  const sus = v.suspension;
+  const susHtml = sus && sus.history.length
+    ? `<div class="panel"><h3>联排停排记录（只读）</h3>
+        <div class="muted">共 ${sus.completedCount} 段已恢复，累计中断 ${sus.totalInterruptMinutes} 分钟${sus.latestResumeTimeText ? `；最近恢复时刻 ${esc(sus.latestResumeTimeText)}` : ''}${sus.active ? '；<strong class="sus-active-tag">当前仍停排中</strong>' : ''}。</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>#</th><th>停排时刻</th><th>恢复时刻</th><th>中断</th><th>原因 / 操作者</th><th>状态</th></tr></thead>
+          <tbody>${suspensionHistoryRows(sus.history)}</tbody>
+        </table></div></div>` : '';
   $('#version-detail').innerHTML = `
     <div class="panel">
       <h3>回看：第 ${v.versionNo} 版（只读）${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : ''}</h3>
       <div class="muted">${esc(v.note)} · 发布于 ${esc(v.createdAt)}</div>
     </div>
     ${conflictHtml}
+    ${susHtml}
     ${deputyHtml}
     <div class="panel"><div class="table-wrap"><table>
       <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>放行签认</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>

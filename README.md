@@ -161,6 +161,28 @@ npm start
 - 解释与**同一版本的现场重算结果一致**：登记、更正或跳过后刷新页面即可看到最新解释；历史版本按归档状态**只读回看**；
 - 目标为**已开始 / 已完成 / 已跳过**项时给出明确说明（无待解释的排期开始）；目标或版本不存在时返回 404；查询为只读，**不改动登记与已发布计划**。
 
+#### 联排中断停排 / 恢复（本轮新增）
+
+联排因故中断时，舞监在「现场联排」页的「联排中断停排 / 恢复」面板对**当前执行版**操作：
+
+1. **登记停排**：填写当日 **HH:MM 停排时刻与非空原因**（≤200 字）；系统校验：
+   - 同版**只能有一段进行中的停排**（重复登记 409 `SUSPENSION_EXISTS`），须先恢复再开新段；
+   - 时刻必须**严格递增**：停排时刻晚于上一段恢复时刻，恢复时刻晚于本段停排时刻与上一段恢复时刻（400 `BAD_INPUT`）；
+   - **不得覆盖已登记的实际开始或实际完成**（任一实际时刻不早于停排开始、或落入停排区间即 409 `SUSPENSION_CONFLICT`，逐项列出）；
+   - 仅**当前执行版**可操作（携带旧 `versionId` 返回 409 `VERSION_STALE`）。
+2. **停排生效时的处理**（同一事务、原子完成，任一失败整体拒绝不留部分记录）：
+   - **未开始项**（未跳过、无实际开始/完成）**既有预计结束清除，并推进其登记行版本**（无预计结束的行不推进）；
+   - 本版**全部有效双签失效并保留原因**（「联排已于 HH:MM 停排…，恢复后须重新签认」），恢复后须重签方可开始；
+   - **已开始未完成项的实际登记时间不改**，其推算结束在现场重算中顺延。
+3. **停排期间的门禁**：执行账号的**开始 / 预计结束 / 完成登记**与**新签认**一律拒绝（409 `SUSPENSION_ACTIVE`）；**发布新版也须先恢复**（409 `SUSPENSION_ACTIVE`）；舞监的**更正、跳过仍可办理**，但**更正后的实际开始 / 实际完成不得落入停排区间**（恢复时刻本身允许；409 `SUSPENSION_INTERVAL`）。
+4. **恢复**：舞监填写 **HH:MM 恢复时刻**；系统在同一事务内核验时刻递增与区间未覆盖实际登记，然后：
+   - **未开始项重算开始不得早于最近恢复时刻**（依赖链顺延照常传导：前置重算结束较晚时取更晚者）；
+   - **已开始未完成项**的**按时长推算结束**与**停排前填写的预计结束**顺延该段（及与其执行区间相交的既往各段）**中断分钟**，且**不得早于恢复时刻**；停排前登记的预计结束在恢复时**物化为顺延后的新值并推进登记行版本**，**实际登记时间不改**；按时长推算结束由重算实时顺延、不写登记行；
+   - 依赖顺延与**同岗位冲突随更新后的排期同步重算**。
+5. **记录与回看**：每段停排（序号、停排/恢复时刻、原因、操作者与时间戳）随版本留存，`GET /api/live` 与 `GET /api/versions/:id` 的 `suspension` 字段返回进行中状态与全部历史；版本列表含已恢复停排段计数；新发布版不继承停排（新版无记录）。
+6. **现场显示**：停排中页面顶部红色横幅提示，执行账号登记按钮替换为「⛔ 停排中，暂停登记」，舞监签认按钮隐藏；恢复后绿色横幅汇总累计中断分钟，表格展示更新后的重算排期。
+7. **重复操作 / 过期版本 / 无效时刻整体拒绝**：无进行中段时重复恢复返回 409 `NO_ACTIVE_SUSPENSION`；时间格式错误、空原因返回 400；所有写入均在单事务内完成，**不留下部分记录**；既有单项登记格式、登记行版本与双签门禁规则保持兼容（停排清除预计结束与恢复物化预计结束同样按行版本 +1 参与乐观锁）。
+
 #### 双人放行签认（本轮新增）
 
 联排中有些提示项必须经**舞监与当班执行人双人放行**后才能开始：
@@ -183,6 +205,7 @@ npm start
   - **预计结束**：未开始或已开始均可登记，不得早于（实际或原计划）开始；
 - **代班识别**：若你被指定为某岗位代班，页面顶部黄色横幅提示「你正在代班岗位…」，该岗位行同样高亮并可登记（自己原有岗位权限保留）；若你的岗位被他人代班，横幅提示登记权已移交，本岗位行显示「已由 XX 代班」且不再出现操作按钮；
 - 非本岗位提示项只读；对非最新（已归档）版本不能登记；
+- **联排停排期间（页面顶部红色横幅）本岗位的开始 / 预计结束 / 完成登记全部暂停**，登记按钮显示「⛔ 停排中，暂停登记」；恢复后未开始项的重算开始不早于恢复时刻，已开始未完成项的结束按中断分钟顺延，按刷新后的排期继续登记即可；
 - 已完成项保留实际时间不再变化；未开始项按前置链重算，**重算开始不早于原计划**；
 - **被舞监标记为跳过的提示项只读展示（紫色「已跳过」），无登记按钮**，跳过项不计入待执行时段与岗位冲突，其后继只按未跳过前置重算；
 - 顺延产生的同岗位时段冲突在页面顶部红色横幅逐条展示，同时相关行标注「已顺延」；
@@ -203,6 +226,7 @@ npm start
 - **依赖链跳过同样以链中每项的登记行版本号为乐观锁**：确认必须回传预览所见的每个 `rowVersion`；预览后任一项被登记或更正（行版本推进），整次跳过 409 拒绝；跳过成功后新跳过项行版本 +1（已跳过项不重复更新）。
 - **现场顺延预演（只读）在单次事务内同时核对所见执行版与全部提示项登记行版本**：请求必须携带 `versionId` 与 `rows: [{cueRef, rowVersion}]`（全部提示项，一项不能少）；版本已归档、行集合与当前版本不一致、或任一登记行版本已推进，均以 409 `WHATIF_STALE` 整体拒绝并逐项给出当前行版本，不会返回基于混合时点的预演结果；预演不推进任何版本号、不写入数据，可对同一快照反复试算。
 - **放行签认以「目标 + 直接前置项登记行版本快照」为一致性基准**：签认提交校验目标登记行版本（过期 409 `VERSION_CONFLICT`）；签认本身**不推进登记行版本**，因此两类签认可先后基于同一行版本完成。此后目标或任一直接前置项的登记行版本推进（岗位登记、舞监更正、跳过）即令相关签认失效；开始提交在同一事务内复核当前执行版、行版本、权限与两类签认有效性，缺签或失效以 409 `SIGNOFF_MISSING` 整体拒绝，不写入部分结果。
+- **联排停排以「版本 + 序号 + 进行中唯一」为一致性基准**：每版至多一段进行中停排（部分唯一索引兜底）；停排时被清除预计结束的未开始项**行版本 +1**，恢复时被顺延物化预计结束的已开始未完成项同样 **+1**，岗位持旧页面提交按 409 `VERSION_CONFLICT` 处理；停排开始 / 恢复时刻必须严格递增且不得覆盖已登记实际时刻，重复登记 / 重复恢复 / 过期版本 / 无效时刻均整体拒绝，不留下部分记录；停排记录随版本留存，历史版只读回看。
 
 ## 五、配置项（环境变量）
 
@@ -251,18 +275,20 @@ SESSION_SECRET=your-long-random-secret
 | POST/PUT/DELETE | `/api/draft/cues[/:id]` | 舞监 | 提示项增改删（校验草稿版本号/行版本号） |
 | POST/DELETE | `/api/draft/deps[/:id]` | 舞监 | 前置关系增删（校验草稿版本号） |
 | GET | `/api/publish/handover/preview` | 舞监 | **发布前交接预览**：旧执行版已完成项的交接资格、不合格原因、旧登记行版本；无旧版时列表为空 |
-| POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE` |
-| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release`、本版代班记录 `deputies`；执行账号另含有效岗位 `myPositions`） |
+| POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE`；**旧执行版停排中返回 409 `SUSPENSION_ACTIVE`，须先恢复** |
+| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release`、本版代班记录 `deputies`、**停排状态与历史 `suspension`**；执行账号另含有效岗位 `myPositions`） |
 | GET | `/api/live/deputies` | 已登录 | 当前执行版代班记录（含已撤销历史）；舞监另返回可选岗位 `positions` 与执行账号 `operators` |
 | POST | `/api/live/deputies` | 舞监 | 启用岗位代班（仅当前执行版）；重复启用 409 `DEPUTY_EXISTS`；同事务使失去登记权者的签认失效 |
 | POST | `/api/live/deputies/revoke` | 舞监 | 撤销岗位在任代班；无在任代班 409 `NO_ACTIVE_DEPUTY`；同事务使失去登记权者的签认失效 |
-| POST | `/api/live/signoffs` | 执行岗位 / 舞监 | **双人放行签认**（仅当前执行版、需放行且未开始项）：`kind=operator` 执行人签认就绪（须当下有该岗位登记权）、`kind=sm` 舞监签认可执行；记录签认人、时间及目标与直接前置项登记行版本快照；重复签认 409 `SIGNOFF_EXISTS`，已开始/完成 409 `SIGNOFF_STATE`，已跳过 409 `CUE_SKIPPED`，未标记需放行 400 `RELEASE_NOT_REQUIRED` |
-| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（同一事务内复核当前版、代班授权、行版本号；已跳过项 409 `CUE_SKIPPED`；需放行项 start 前须双签齐备，否则 409 `SIGNOFF_MISSING`） |
-| POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`） |
+| POST | `/api/live/signoffs` | 执行岗位 / 舞监 | **双人放行签认**（仅当前执行版、需放行且未开始项）：`kind=operator` 执行人签认就绪（须当下有该岗位登记权）、`kind=sm` 舞监签认可执行；记录签认人、时间及目标与直接前置项登记行版本快照；重复签认 409 `SIGNOFF_EXISTS`，已开始/完成 409 `SIGNOFF_STATE`，已跳过 409 `CUE_SKIPPED`，未标记需放行 400 `RELEASE_NOT_REQUIRED`，**停排中 409 `SUSPENSION_ACTIVE`** |
+| POST | `/api/live/suspensions` | 舞监 | **登记停排**（仅当前执行版）：`{versionId, suspendTimeText:"HH:MM", reason}`；同版进行中唯一（409 `SUSPENSION_EXISTS`），时刻须晚于上一段恢复时刻（400），不得覆盖已登记实际开始/完成（409 `SUSPENSION_CONFLICT`，逐项列出）；停排时清除未开始项既有预计结束并推进其行版本、本版有效双签全部失效留痕 |
+| POST | `/api/live/suspensions/resume` | 舞监 | **恢复联排**（仅当前执行版）：`{versionId, resumeTimeText:"HH:MM"}`；无进行中段 409 `NO_ACTIVE_SUSPENSION`，时刻不递增 / 区间覆盖实际登记分别返回 400 / 409 `SUSPENSION_CONFLICT`；恢复后未开始项重算开始不早于恢复时刻，已开始未完成项推算 / 预计结束顺延中断分钟（预计结束物化并推进行版本，实际登记时间不改），返回逐行顺延明细 |
+| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（同一事务内复核当前版、代班授权、行版本号；已跳过项 409 `CUE_SKIPPED`；需放行项 start 前须双签齐备，否则 409 `SIGNOFF_MISSING`；**停排中一律 409 `SUSPENSION_ACTIVE`**） |
+| POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`；**停排中仍可办理，但实际开始/完成不得落入停排区间，否则 409 `SUSPENSION_INTERVAL`**） |
 | GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
 | POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
 | POST | `/api/live/whatif` | 舞监 | **现场顺延预演**（仅当前执行版，只读）：携带 `versionId`、全部登记行 `rows[]` 与一项或多项假设 `assumptions[]`；同一快照同时套用全部假设重算，返回逐项待执行开始/结束差异与新增/消失/仍存在的同岗位冲突；版本或任一行变化整体 409 `WHATIF_STALE`，无效假设 400 `WHATIF_INVALID`，不写入任何数据 |
-| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip` 与放行签认 `release`，含全部签认记录 `release.records` 及失效原因，只读） |
+| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`、**已恢复停排段数 `suspensionCount`**）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release` 与**停排状态/历史 `suspension`**：含全部停排段记录、累计中断分钟、最近恢复时刻；只读） |
 | GET | `/api/versions/:id/cues/:cueRef/explain` | 已登录 | **排期开始来源解释**（当前执行版与历史版本通用，只读）：以原计划开始为基线，达到最终最大约束时刻的直接前置全部列出并逐层追溯来源；目标已开始/已完成/已跳过返回明确说明 |
 
 ## 八、登记交接 API 调用示例
@@ -945,3 +971,191 @@ curl -b sm.cookie -s -X POST http://localhost:3000/api/live/deputies \
 | 已开始 / 已完成项签认 | 409 | `SIGNOFF_STATE` |
 | 已跳过项签认 | 409 | `CUE_SKIPPED` |
 | 需放行项缺有效双签即登记开始 | 409 | `SIGNOFF_MISSING`（`items` 逐项列出缺失类别） |
+
+## 十四、联排中断停排 / 恢复 API 调用示例（本轮新增）
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。仅**舞监**可登记停排 / 恢复，仅**当前执行版**可操作；全部校验与写入在同一事务内完成，重复操作、过期版本、无效时刻均**整体拒绝，不留部分记录**。
+
+下例以播种的第 1 版为当前执行版（`L1 19:00/5分 → S1 19:05/3分 → L2 19:10/8分` …）。
+
+### 1. 登记停排（HH:MM + 非空原因）
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' -d '{"username":"sm","password":"sm12345"}'
+
+# 假设 L1 已于 19:00 实际开始（灯光岗位登记）；19:03 起设备故障停排
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"suspendTimeText":"19:03","reason":"舞台机械故障，紧急检修"}'
+```
+
+成功返回 **201**，`version` 为最新现场负载（同 `GET /api/live`），并附本次汇总：
+
+```json
+{
+  "version": {
+    "id": 1, "versionNo": 1, "isLatest": true,
+    "suspension": {
+      "active": {
+        "id": 1, "seq": 1, "suspendTime": 1143, "suspendTimeText": "19:03",
+        "resumeTime": null, "resumeTimeText": null, "active": true,
+        "reason": "舞台机械故障，紧急检修",
+        "suspendedBy": "舞监", "suspendedAt": "2026-10-05 19:03:20"
+      },
+      "history": [ { "seq": 1, "suspendTimeText": "19:03", "active": true } ],
+      "completedCount": 0, "totalInterruptMinutes": 0,
+      "latestResumeTime": null, "latestResumeTimeText": null
+    }
+  },
+  "suspension": {
+    "suspensionId": 1, "suspendTimeText": "19:03",
+    "reason": "舞台机械故障，紧急检修", "suspendedBy": "舞监",
+    "clearedEstimateRows": 0
+  }
+}
+```
+
+- `clearedEstimateRows`：停排时被**清除既有预计结束并推进行版本**的未开始项行数（无预计结束的未开始项不推进；已开始项与跳过项不动）；
+- 停排生效同时，本版**全部有效双签置为失效**（记录原因「联排已于 19:03 停排（原因：…），停排前签认全部失效，恢复后须重新签认」）；
+- 进行中重算只使用已恢复停排段，故刚停排时已开始项的现场结束仍显示停排前推算值，恢复后顺延。
+
+### 2. 停排期间：执行登记、新签认、发布新版全部被拒
+
+```bash
+# 执行账号登记完成 / 开始 / 预计结束 -> 409
+curl -b light.cookie -s -X POST http://localhost:3000/api/registrations \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":2,"action":"complete","time":"19:06"}'
+# {"error":"SUSPENSION_ACTIVE","message":"当前执行版处于停排中，停排期间执行岗位不能登记开始、预计结束或完成；请等待舞监恢复联排"}
+
+# 新签认 -> 409（执行人 / 舞监均拒绝）
+curl -b light.cookie -s -X POST http://localhost:3000/api/live/signoffs \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":4,"rowVersion":1,"kind":"operator"}'
+# {"error":"SUSPENSION_ACTIVE","message":"当前执行版处于停排中，停排期间不能签认；请待舞监恢复联排后重新签认"}
+
+# 发布新版 -> 409（须先恢复）
+curl -b sm.cookie -s -X POST http://localhost:3000/api/publish \
+  -H 'Content-Type: application/json' -d '{"version":1,"note":"新版"}'
+# {"error":"SUSPENSION_ACTIVE","message":"当前执行版处于停排中，发布新版前须先由舞监填写恢复时刻恢复联排"}
+
+# 重复登记停排 -> 409
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/suspensions \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"suspendTimeText":"19:08","reason":"又停"}'
+# {"error":"SUSPENSION_EXISTS","message":"当前执行版已有一段进行中的停排，请先填写恢复时刻后再登记新的停排"}
+```
+
+舞监的**更正与跳过仍可办理**，但更正后的实际时刻不得落入停排区间（恢复时刻本身允许）：
+
+```bash
+# 把实际开始改到停排区间内 19:06 -> 409
+curl -b sm.cookie -s -X POST http://localhost:3000/api/registrations/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":2,"field":"actual_start","actualStartText":"19:06","reason":"口误"}'
+# {"error":"SUSPENSION_INTERVAL","message":"「L1」更正后的实际开始 19:06 不得落入停排区间（该时刻处于当前进行中的停排区间内），请改填停排前或恢复时刻之后的时间"}
+
+# 改到停排前 19:01 -> 200（跳过链预览 / 确认同样照常可用）
+```
+
+### 3. 恢复：未开始项不早于恢复时刻，运行中项结束顺延并物化
+
+假设 L1 停排前曾登记预计结束 19:07；19:15 恢复（中断 10 分钟）：
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/suspensions/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"resumeTimeText":"19:15"}'
+```
+
+```json
+{
+  "version": { "suspension": {
+      "active": null,
+      "completedCount": 1, "totalInterruptMinutes": 10,
+      "latestResumeTime": 1155, "latestResumeTimeText": "19:15",
+      "history": [
+        { "seq": 1, "suspendTimeText": "19:03", "resumeTimeText": "19:15",
+          "active": false, "durationMinutes": 10, "reason": "舞台机械故障，紧急检修",
+          "suspendedBy": "舞监", "resumedBy": "舞监" }
+      ] } },
+  "suspension": {
+    "suspensionId": 1, "suspendTimeText": "19:03", "resumeTimeText": "19:15",
+    "durationMinutes": 10, "reason": "舞台机械故障，紧急检修", "resumedBy": "舞监",
+    "shiftedRows": [
+      { "cueRef": 1, "code": "L1", "shiftMinutes": 10,
+        "oldEstimatedEndText": "19:07", "newEstimatedEndText": "19:17" }
+    ]
+  }
+}
+```
+
+恢复后 `GET /api/live` 的排期（依赖顺延 + 最近恢复时刻联动）：
+
+| 提示项 | 状态 | 重算开始 | 重算结束 | 说明 |
+| --- | --- | --- | --- | --- |
+| L1 | RUNNING | 19:00（实际开始不改） | **19:17** | 停排前预计结束 19:07 顺延 10 分钟并物化，行版本 +1；若无预计结束则按时长推算同样顺延（`suspensionShiftMinutes=10`） |
+| S1 | PENDING | **19:17** | 19:20 | 原计划 19:05；取前置 L1 结束 19:17 与最近恢复时刻 19:15 的最大者；停排时既有预计结束已清除 |
+| L2 / S2 / L3 | PENDING | 19:20 / 19:20 / 19:28 | … | 依赖链继续传导；同岗位冲突按更新后排期同步重算 |
+
+- 已完成项的**实际开始 / 实际完成绝不改动**；顺延只影响已开始未完成项的推算 / 预计结束与未开始项的重算开始；
+- 运行中项顺延后的预计结束**不早于恢复时刻**；多段停排时与执行区间相交的各段中断分钟**累计计入**。
+
+### 4. 恢复后须重签才能开始
+
+停排前的双签在开停时已失效；恢复后未重签直接登记需放行项的开始，仍返回 409 `SIGNOFF_MISSING`。执行人与舞监按第十三节重新签认（基于推进后的最新行版本）后即可登记：
+
+```bash
+curl -b light.cookie -s -X POST http://localhost:3000/api/live/signoffs \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"cueRef":4,"rowVersion":1,"kind":"operator"}'
+curl -b sm.cookie   -s -X POST http://localhost:3000/api/live/signoffs \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"cueRef":4,"rowVersion":1,"kind":"sm"}'
+```
+
+### 5. 多段停排：时刻严格递增
+
+```bash
+# 第二段停排：必须晚于上一段恢复时刻 19:15
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/suspensions \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"suspendTimeText":"19:14","reason":"x"}'
+# 400 BAD_INPUT：停排时刻 19:14 必须晚于上一段停排的恢复时刻 19:15
+
+# 恢复时刻不晚于本段停排时刻
+# 400 BAD_INPUT：恢复时刻 19:30 必须晚于停排时刻 19:40
+
+# 无进行中停排时重复恢复
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/suspensions/resume \
+  -H 'Content-Type: application/json' -d '{"versionId":1,"resumeTimeText":"19:50"}'
+# 409 NO_ACTIVE_SUSPENSION：当前执行版没有进行中的停排，无需恢复
+```
+
+### 6. 历史版回看与版本列表
+
+```bash
+# 版本列表含已恢复停排段计数
+curl -b sm.cookie -s http://localhost:3000/api/versions
+# {"versions":[{"versionNo":1,"suspensionCount":2,"skipCount":0,...}]}
+
+# 历史版（及当前版）负载均带 suspension：进行中状态（历史版通常为 null）+ 全部停排段
+curl -b sm.cookie -s http://localhost:3000/api/versions/1
+```
+
+- 新发布版**不继承**停排记录与停排状态（新版 `suspension.history` 为空）；
+- 排期来源解释 `GET /api/versions/:id/cues/:cueRef/explain` 与顺延预演 `POST /api/live/whatif` 使用同一停排感知重算：运行中前置的结束来源标注「（含停排顺延 N 分钟）」，未开始项的重算开始包含最近恢复时刻下界。
+
+### 7. 错误一览（均整体拒绝，不留部分记录）
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 非舞监登记停排 / 恢复 | 403 | `FORBIDDEN` |
+| 尚未发布任何版本 | 409 | `NO_LIVE_VERSION` |
+| 携带的 `versionId` 已不是当前执行版 | 409 | `VERSION_STALE` |
+| 停排 / 恢复时刻不是 HH:MM、原因为空或超 200 字 | 400 | `BAD_INPUT` |
+| 停排时刻不晚于上一段恢复时刻 / 恢复时刻不晚于停排时刻 | 400 | `BAD_INPUT`（消息明确给出两个时刻） |
+| 已有进行中停排仍登记停排 | 409 | `SUSPENSION_EXISTS` |
+| 无进行中停排却恢复 | 409 | `NO_ACTIVE_SUSPENSION` |
+| 停排 / 恢复区间覆盖已登记实际开始或完成 | 409 | `SUSPENSION_CONFLICT`（`items` 逐项列出） |
+| 停排期间执行账号登记 | 409 | `SUSPENSION_ACTIVE` |
+| 停排期间新签认 | 409 | `SUSPENSION_ACTIVE` |
+| 停排期间发布新版 | 409 | `SUSPENSION_ACTIVE` |
+| 更正后的实际开始 / 完成落入停排区间（恢复时刻本身允许） | 409 | `SUSPENSION_INTERVAL` |

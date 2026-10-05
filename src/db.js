@@ -156,6 +156,27 @@ CREATE TABLE IF NOT EXISTS release_signoffs (
   invalidated_at TEXT
 );
 
+-- 联排中断停排（按执行版记录，仅当前执行版可开停/恢复，恢复后整段留痕供历史版回看）。
+-- 同版至多一段「进行中」停排（resume_time 为 NULL）；时刻为当日 00:00 起分钟数，必须严格递增。
+CREATE TABLE IF NOT EXISTS rehearsal_suspensions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id     INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  seq            INTEGER NOT NULL,          -- 本版第几段停排（从 1 开始）
+  suspend_time   INTEGER NOT NULL,          -- 停排开始（分钟）
+  resume_time    INTEGER,                   -- 恢复时刻（分钟），NULL 表示进行中
+  reason         TEXT NOT NULL,             -- 非空停排原因
+  suspended_by   TEXT NOT NULL,
+  suspended_at   TEXT NOT NULL,             -- 操作时间戳（留痕用）
+  resumed_by     TEXT,
+  resumed_at     TEXT,
+  UNIQUE(version_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_suspensions_version ON rehearsal_suspensions(version_id);
+-- 同版至多一段进行中的停排（部分唯一索引）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_suspensions_active
+  ON rehearsal_suspensions(version_id) WHERE resume_time IS NULL;
+
 -- 签认时直接前置项登记行版本快照（任一变化即失效）
 CREATE TABLE IF NOT EXISTS release_signoff_preds (
   signoff_id  INTEGER NOT NULL REFERENCES release_signoffs(id) ON DELETE CASCADE,

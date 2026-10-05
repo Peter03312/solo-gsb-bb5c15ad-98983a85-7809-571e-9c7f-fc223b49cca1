@@ -81,6 +81,41 @@ function halfOpenOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
+// 已完成停排段（均含恢复时刻），按停排开始升序；进行中段（无恢复时刻）不参与重算
+function completedSuspensionSegments(segments) {
+  return (segments || [])
+    .map((s) => ({
+      start: s.suspend ?? s.suspendTime ?? null,
+      end: s.resume ?? s.resumeTime ?? null,
+    }))
+    .filter((s) => Number.isInteger(s.start) && Number.isInteger(s.end) && s.end > s.start)
+    .sort((a, b) => a.start - b.start);
+}
+
+/**
+ * 已开始项的推算结束（按时长推算或停排前登记的预计结束）顺延中断分钟。
+ * 实际开始到推算结束之间（半开区间）发生的每段停排整段计入；
+ * 段按时间升序单遍扫描，前段把结束推后落入后段时后段同样计入。
+ * 仅当确有停排段相交时顺延，且结果不早于所相交最后一段的恢复时刻。
+ * 返回 { end, shiftMinutes }；无相交时段时原样返回。
+ */
+function extendEndAcrossSuspensions(actualStart, baseEnd, segs) {
+  let end = baseEnd;
+  let shift = 0;
+  let lastAppliedResume = null;
+  for (const s of segs) {
+    if (actualStart < s.end && s.start < end) {
+      end += s.end - s.start;
+      shift += s.end - s.start;
+      lastAppliedResume = s.end;
+    }
+  }
+  if (lastAppliedResume !== null && end < lastAppliedResume) {
+    end = lastAppliedResume;
+  }
+  return { end, shiftMinutes: shift };
+}
+
 /**
  * 发布前计划校验。
  * cues: [{id, code, position, plannedStart, duration}]
@@ -164,12 +199,19 @@ function validatePlan(cues, deps) {
  * publishedCues: [{id(=cueRef), code, title, position, plannedStart, duration}]
  * deps: [{from, to}]（以 cueRef 表示）
  * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, skipped, rowVer, updatedBy, updatedAt}
+ * options.segments: 本版停排段 [{suspend, resume}]（分钟；resume=null 为进行中，不参与重算）
+ *   - 已开始未完成项：按时长推算结束与停排前填写的预计结束（恢复时已物化为新值）
+ *     顺延执行区间内的中断分钟，且不早于所相交最后一段的恢复时刻；实际登记时间不改；
+ *   - 未开始项：重算开始不早于最近恢复时刻；其后置顺延与同岗位冲突随之联动。
  *
  * 舞监标记为跳过的项：状态 SKIPPED，不产生待执行时段，不参与前置顺延与岗位冲突，
  * 其他项仍按现有前置与登记规则重算。
  * 返回 { cues: [...], conflicts: [{position,a,b,message}], orderProblem: null|message }
  */
-function computeLive(publishedCues, deps, regMap) {
+function computeLive(publishedCues, deps, regMap, options = {}) {
+  const segments = completedSuspensionSegments(options.segments);
+  // 最近恢复时刻（无已完成停排段时为 null）：未开始项重算开始下界
+  const latestResume = segments.length ? segments[segments.length - 1].end : null;
   const byId = new Map(publishedCues.map((c) => [c.id, c]));
   const preds = new Map();
   publishedCues.forEach((c) => preds.set(c.id, []));
@@ -196,6 +238,7 @@ function computeLive(publishedCues, deps, regMap) {
     const skipped = r.skipped === true || r.skipped === 1;
 
     let status, schedStart, schedEnd, effStart;
+    let suspensionShift = 0; // 已开始项因停排顺延的分钟数（仅 RUNNING）
 
     if (skipped) {
       // 已跳过：只展示，不产生待执行时段；其前置约束对后项不再生效（前置不可执行导致本项一同跳过）
@@ -209,7 +252,12 @@ function computeLive(publishedCues, deps, regMap) {
     } else if (as !== null) {
       status = 'RUNNING';
       schedStart = as;
-      schedEnd = ee !== null ? ee : as + cue.duration;
+      // 停排前填写的预计结束已在恢复时物化为顺延后的值；按时长推算同样顺延中断分钟。
+      // 实际开始/实际完成（完成项）不做任何改动。
+      const baseEnd = ee !== null ? ee : as + cue.duration;
+      const ext = extendEndAcrossSuspensions(as, baseEnd, segments);
+      schedEnd = ext.end;
+      suspensionShift = ext.shiftMinutes;
     } else {
       status = 'PENDING';
       let start = cue.plannedStart; // 开始时刻不得早于原计划
@@ -218,6 +266,8 @@ function computeLive(publishedCues, deps, regMap) {
         // 已跳过的前置不计入待执行时段：不约束后项开始
         if (pc && pc.status !== 'SKIPPED') start = Math.max(start, pc.schedEnd);
       }
+      // 恢复后：未开始项重算开始不得早于最近恢复时刻
+      if (latestResume !== null) start = Math.max(start, latestResume);
       effStart = start;
       schedStart = start;
       schedEnd = ee !== null ? ee : start + cue.duration;
@@ -232,6 +282,7 @@ function computeLive(publishedCues, deps, regMap) {
       skipped,
       schedStart,
       schedEnd,
+      suspensionShift,
       delayed: status === 'PENDING' && schedStart > cue.plannedStart,
       rowVer: r.rowVer ?? 1,
       updatedBy: r.updatedBy ?? null,
@@ -287,8 +338,8 @@ const EXPLAIN_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE:
  * publishedCues / deps / regMap 与 computeLive 入参相同；
  * cueRef 为目标提示项引用；skipReasons 可选 Map(cueRef -> 跳过原因)，仅用于展示。
  */
-function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons) {
-  const live = computeLive(publishedCues, deps, regMap);
+function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons, options = {}) {
+  const live = computeLive(publishedCues, deps, regMap, options);
   if (live.orderProblem) {
     return { applicable: false, reason: `已发布数据检测到依赖环，无法重算：${live.orderProblem}` };
   }
@@ -332,7 +383,8 @@ function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons) {
 
   // 单个前置的结束时刻来源；未开始且按时长推算时继续向下追溯其重算开始的形成
   function traceNode(p, stack) {
-    const node = { ...brief(p), end: p.schedEnd, endText: minToTime(p.schedEnd) };
+    const shiftText = p.suspensionShift > 0 ? `（含停排顺延 ${p.suspensionShift} 分钟）` : '';
+    const node = { ...brief(p), end: p.schedEnd, endText: minToTime(p.schedEnd), suspensionShift: p.suspensionShift || 0 };
     if (p.status === 'DONE') {
       node.endSource = 'actual';
       node.endSourceLabel = '实际完成';
@@ -340,11 +392,11 @@ function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons) {
     } else if (p.estimatedEnd !== null && p.estimatedEnd !== undefined) {
       node.endSource = 'estimated';
       node.endSourceLabel = '预计结束';
-      node.endDetail = `${p.status === 'RUNNING' ? '已开始，' : ''}登记的预计结束 ${minToTime(p.estimatedEnd)}`;
+      node.endDetail = `${p.status === 'RUNNING' ? '已开始，' : ''}登记的预计结束 ${minToTime(p.estimatedEnd)}${shiftText}`;
     } else if (p.status === 'RUNNING') {
       node.endSource = 'duration';
       node.endSourceLabel = '按时长推算';
-      node.endDetail = `实际开始 ${minToTime(p.actualStart)} + 时长 ${p.duration} 分`;
+      node.endDetail = `实际开始 ${minToTime(p.actualStart)} + 时长 ${p.duration} 分${shiftText}`;
     } else {
       node.endSource = 'duration';
       node.endSourceLabel = '按时长推算';
@@ -440,8 +492,8 @@ const WHATIF_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: 
  *   { errors: [{cueRef, code, reason}] }  存在无效假设时调用方应整体拒绝（不产出任何结果）
  *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept, summary }
  */
-function simulateWhatIf(publishedCues, deps, regMap, assumptions) {
-  const baseline = computeLive(publishedCues, deps, regMap);
+function simulateWhatIf(publishedCues, deps, regMap, assumptions, options = {}) {
+  const baseline = computeLive(publishedCues, deps, regMap, options);
   if (baseline.orderProblem) return { orderProblem: baseline.orderProblem };
 
   // 预演登记：一次性套用全部假设（只改预计结束；不动实际开始/完成、跳过状态与计划）
@@ -453,7 +505,7 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions) {
   }
 
   // 全部假设同时生效后的重算结果
-  const scenario = computeLive(publishedCues, deps, whatReg);
+  const scenario = computeLive(publishedCues, deps, whatReg, options);
 
   const baseByRef = new Map(baseline.cues.map((c) => [c.id, c]));
   const scenByRef = new Map(scenario.cues.map((c) => [c.id, c]));
@@ -565,4 +617,5 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions) {
 
 module.exports = {
   timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
+  extendEndAcrossSuspensions,
 };
